@@ -1,17 +1,19 @@
 "use client";
-import { useEffect, useMemo, useState, useCallback } from "react";
+import { useEffect, useMemo, useState, useCallback, useRef } from "react";
+import * as XLSX from "xlsx";
+import { saveAs } from "file-saver";
 
 const PRIORITY_CONFIG = {
-  Critical: { bg: "bg-red-100 dark:bg-red-900/40",    text: "text-red-700 dark:text-red-300",    dot: "bg-red-500"    },
+  Critical: { bg: "bg-red-100 dark:bg-red-900/40",       text: "text-red-700 dark:text-red-300",       dot: "bg-red-500"    },
   High:     { bg: "bg-orange-100 dark:bg-orange-900/40", text: "text-orange-700 dark:text-orange-300", dot: "bg-orange-500" },
   Medium:   { bg: "bg-yellow-100 dark:bg-yellow-900/40", text: "text-yellow-700 dark:text-yellow-300", dot: "bg-yellow-500" },
-  Low:      { bg: "bg-green-100 dark:bg-green-900/40",  text: "text-green-700 dark:text-green-300",  dot: "bg-green-500"  },
+  Low:      { bg: "bg-green-100 dark:bg-green-900/40",   text: "text-green-700 dark:text-green-300",   dot: "bg-green-500"  },
 };
 
 const STATUS_CONFIG = {
-  "Todo":        { bg: "bg-gray-100 dark:bg-gray-700",       text: "text-gray-600 dark:text-gray-300",   icon: "⬜" },
-  "In Progress": { bg: "bg-blue-100 dark:bg-blue-900/40",    text: "text-blue-700 dark:text-blue-300",   icon: "🔄" },
-  "Done":        { bg: "bg-emerald-100 dark:bg-emerald-900/40", text: "text-emerald-700 dark:text-emerald-300", icon: "✅" },
+  "Todo":        { bg: "bg-gray-100 dark:bg-gray-700",            text: "text-gray-600 dark:text-gray-300",         icon: "⬜" },
+  "In Progress": { bg: "bg-blue-100 dark:bg-blue-900/40",         text: "text-blue-700 dark:text-blue-300",         icon: "🔄" },
+  "Done":        { bg: "bg-emerald-100 dark:bg-emerald-900/40",   text: "text-emerald-700 dark:text-emerald-300",   icon: "✅" },
 };
 
 const CATEGORY_COLORS = [
@@ -46,6 +48,7 @@ export default function TasksPage() {
   const [selectedCategory, setSelectedCategory] = useState("");
   const [selectedStatus, setSelectedStatus] = useState("");
   const [selectedPriority, setSelectedPriority] = useState("");
+  const importFileRef = useRef(null);
 
   const emptyForm = { title: "", description: "", category: "General", priority: "Medium", status: "Todo", estimatedDate: "" };
   const [formData, setFormData] = useState(emptyForm);
@@ -84,7 +87,6 @@ export default function TasksPage() {
     });
   }, [tasks, search, selectedCategory, selectedStatus, selectedPriority]);
 
-  // Stats
   const stats = useMemo(() => ({
     total: tasks.length,
     todo: tasks.filter((t) => t.status === "Todo").length,
@@ -141,9 +143,62 @@ export default function TasksPage() {
 
   function resetForm() { setEditingId(null); setFormData(emptyForm); setFormOpen(false); }
 
-  const hasActiveFilter = search || selectedCategory || selectedStatus || selectedPriority;
+  // ── Excel Import ──────────────────────────────────────────────────────────
+  async function handleExcelImport(event) {
+    const file = event.target.files[0]; if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+      const workbook = XLSX.read(e.target.result, { type: "binary" });
+      const json = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]]);
+      const VALID_PRIORITIES = ["Low", "Medium", "High", "Critical"];
+      const VALID_STATUSES   = ["Todo", "In Progress", "Done"];
+      const formatted = json.map((item) => ({
+        title:         String(item.Title         || "").trim(),
+        description:   String(item.Description   || "").trim(),
+        category:      String(item.Category      || "General").trim() || "General",
+        priority:      VALID_PRIORITIES.includes(String(item.Priority || "").trim()) ? String(item.Priority).trim() : "Medium",
+        status:        VALID_STATUSES.includes(String(item.Status || "").trim())     ? String(item.Status).trim()   : "Todo",
+        estimatedDate: item["Estimated Date"] ? new Date(item["Estimated Date"]) : null,
+      })).filter((item) => item.title);
+      if (!formatted.length) { showToast("⚠️ No valid rows found — ensure a 'Title' column exists.", "error"); return; }
+      const existingTitles = new Set(tasks.map((t) => t.title.trim().toLowerCase()));
+      const skipped = [], toInsert = [];
+      for (const item of formatted) {
+        const key = item.title.toLowerCase();
+        if (existingTitles.has(key)) skipped.push(item.title);
+        else { toInsert.push(item); existingTitles.add(key); }
+      }
+      if (!toInsert.length) { showToast(`⚠️ All ${formatted.length} rows skipped — duplicate titles.`, "error"); return; }
+      try {
+        for (const item of toInsert)
+          await fetch("/api/tasks", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(item) });
+        showToast(skipped.length
+          ? `Imported ${toInsert.length} tasks. Skipped ${skipped.length} duplicate(s).`
+          : `Imported ${toInsert.length} tasks successfully.`);
+        fetchTasks();
+      } catch { showToast("Import failed", "error"); }
+    };
+    reader.readAsBinaryString(file); event.target.value = "";
+  }
 
-  // Group filtered tasks by status for kanban-style display
+  // ── Excel Export ──────────────────────────────────────────────────────────
+  function exportToExcel() {
+    if (!filtered.length) { showToast("Nothing to export", "error"); return; }
+    const data = filtered.map((t) => ({
+      Title:            t.title,
+      Description:      t.description || "",
+      Category:         t.category || "General",
+      Priority:         t.priority || "Medium",
+      Status:           t.status || "Todo",
+      "Estimated Date": t.estimatedDate ? new Date(t.estimatedDate).toLocaleDateString("en-GB") : "",
+      "Created At":     new Date(t.createdAt).toLocaleDateString("en-GB"),
+    }));
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(data), "Tasks");
+    saveAs(new Blob([XLSX.write(wb, { bookType: "xlsx", type: "array" })], { type: "application/octet-stream" }), "tasks.xlsx");
+  }
+
+  const hasActiveFilter = search || selectedCategory || selectedStatus || selectedPriority;
   const todoTasks       = filtered.filter((t) => t.status === "Todo");
   const inProgressTasks = filtered.filter((t) => t.status === "In Progress");
   const doneTasks       = filtered.filter((t) => t.status === "Done");
@@ -163,12 +218,20 @@ export default function TasksPage() {
             <h1 className="text-3xl font-bold text-gray-900 dark:text-white">✅ Tasks</h1>
             <p className="text-sm text-gray-500 mt-1">{stats.total} tasks · {stats.inProgress} in progress · {stats.done} done{stats.overdue > 0 ? ` · ⚠️ ${stats.overdue} overdue` : ""}</p>
           </div>
-          <button
-            onClick={() => { setFormOpen((o) => !o); if (formOpen) resetForm(); }}
-            className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors"
-          >
-            {formOpen ? "✕ Close Form" : "+ Add Task"}
-          </button>
+          <div className="flex flex-wrap gap-2">
+            <button onClick={() => { setFormOpen((o) => !o); if (formOpen) resetForm(); }}
+              className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors">
+              {formOpen ? "✕ Close Form" : "+ Add Task"}
+            </button>
+            <label className="bg-purple-600 hover:bg-purple-700 text-white px-4 py-2 rounded-lg text-sm font-medium cursor-pointer transition-colors">
+              ↑ Import Excel
+              <input ref={importFileRef} type="file" accept=".xlsx,.xls" hidden onChange={handleExcelImport} />
+            </label>
+            <button onClick={exportToExcel}
+              className="bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-lg text-sm font-medium transition-colors">
+              ↓ Export Excel
+            </button>
+          </div>
         </div>
 
         {/* Stats Bar */}
@@ -184,6 +247,11 @@ export default function TasksPage() {
               <span className="text-xs font-medium mt-0.5">{label}</span>
             </div>
           ))}
+        </div>
+
+        {/* Import Format Note */}
+        <div className="mb-6 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-xl px-4 py-3 text-xs text-blue-700 dark:text-blue-300">
+          <strong>Import format:</strong> Columns — <code className="font-mono bg-blue-100 dark:bg-blue-900/50 px-1 rounded">Title</code> (required), <code className="font-mono bg-blue-100 dark:bg-blue-900/50 px-1 rounded">Description</code>, <code className="font-mono bg-blue-100 dark:bg-blue-900/50 px-1 rounded">Category</code>, <code className="font-mono bg-blue-100 dark:bg-blue-900/50 px-1 rounded">Priority</code> (Low/Medium/High/Critical), <code className="font-mono bg-blue-100 dark:bg-blue-900/50 px-1 rounded">Status</code> (Todo/In Progress/Done), <code className="font-mono bg-blue-100 dark:bg-blue-900/50 px-1 rounded">Estimated Date</code>. Duplicate titles are skipped.
         </div>
 
         {/* Form */}
@@ -331,14 +399,12 @@ export default function TasksPage() {
                       const overdue = isOverdue(task.estimatedDate, task.status);
                       return (
                         <div key={task._id} className={`bg-white dark:bg-gray-900 border-2 rounded-xl p-4 shadow-sm flex flex-col gap-3 hover:shadow-md transition-shadow ${overdue ? "border-red-400 dark:border-red-600" : "border-gray-200 dark:border-gray-800"}`}>
-                          {/* Top row */}
                           <div className="flex items-start justify-between gap-2">
                             <h3 className={`font-semibold text-sm leading-snug flex-1 ${task.status === "Done" ? "line-through text-gray-400" : "text-gray-900 dark:text-white"}`}>{task.title}</h3>
                             <button onClick={() => cycleStatus(task)} title="Click to cycle status" className={`text-xs px-2 py-0.5 rounded-full font-medium flex-shrink-0 cursor-pointer ${sCfg.bg} ${sCfg.text}`}>
                               {sCfg.icon}
                             </button>
                           </div>
-                          {/* Badges */}
                           <div className="flex flex-wrap gap-1.5">
                             <span className={`inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded ${catColor.bg} ${catColor.text}`}>
                               <span className={`w-1.5 h-1.5 rounded-full ${catColor.dot}`} />{task.category}
@@ -347,11 +413,9 @@ export default function TasksPage() {
                               <span className={`w-1.5 h-1.5 rounded-full ${pCfg.dot}`} />{task.priority}
                             </span>
                           </div>
-                          {/* Description */}
                           {task.description && (
                             <p className="text-gray-600 dark:text-gray-400 text-xs leading-relaxed line-clamp-3 whitespace-pre-wrap flex-1">{task.description}</p>
                           )}
-                          {/* Footer */}
                           <div className="flex items-center justify-between gap-2 pt-1 border-t dark:border-gray-800">
                             <div className="flex flex-col gap-0.5">
                               {task.estimatedDate && (
